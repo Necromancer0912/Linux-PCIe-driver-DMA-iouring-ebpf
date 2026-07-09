@@ -167,7 +167,7 @@ This project directly mirrors production engineering work in:
 
 ## Advanced Extensions
 
-### ✅ Complete
+### Complete
 - MSI interrupts (vs. legacy INTx)
 - Bidirectional DMA with IRQ-driven `wait_queue` completion
 - Custom ioctl interface with userspace test binary
@@ -177,7 +177,7 @@ This project directly mirrors production engineering work in:
 - **io_uring async DMA interface** (`edu-driver/edu_uring_test.c`) — exposes the DMA engine as an `IORING_OP_URING_CMD` operation. Thread submits a DMA op, remains free while hardware runs, collects the CQE when the ISR-fired workqueue posts it. Includes ioctl vs. io_uring throughput comparison. Same architecture as NVMe character device passthrough.
 - **eBPF interrupt latency profiler** (`ebpf-profiler/`) — kprobes on `edu_isr`, `edu_ioctl`, `__wake_up_common`, and `finish_wait`. Three histogram metrics: ISR execution time, DMA round-trip latency, interrupt-to-wakeup scheduler latency. P50/P95/P99 printed every N seconds. Two implementations: bpftrace one-liner and full CO-RE libbpf program.
 
-### 🚀 Remaining advanced directions
+### Remaining advanced directions
 
 **1. Rust kernel module** — rewrite `edu.c` in Rust using the kernel's in-tree Rust API for PCI devices. Linux has supported Rust kernel modules since v6.1 (Ubuntu 24.04 / kernel 6.8 — should work). Frontier of kernel dev right now.
 
