@@ -225,71 +225,160 @@ new_proj/
 
 ---
 
-## Getting Started
+## Complete Demo Guide — macOS (M-series)
 
-### Prerequisites (macOS)
+Everything below runs on your Mac. The kernel driver, io_uring, and eBPF parts
+run inside a Linux VM (QEMU). The UART framing protocol builds on macOS directly.
+
+---
+
+### Stage 0 — macOS Prerequisites (one time)
 
 ```bash
-brew install qemu cdrtools
-xcode-select --install      # gives you clang + git
+# QEMU + cdrtools (for making the cloud-init ISO)
+brew install qemu cdrtools socat
+
+# Verify HVF acceleration is available
+qemu-system-aarch64 -accel help | grep hvf
+# Expected output: hvf
 ```
 
-### Step 1 — First-time image setup
+---
+
+### Stage 1 — Download Ubuntu + Create VM Disk (one time)
 
 ```bash
-mkdir ~/pcie-driver-project && cd ~/pcie-driver-project
+cd /Users/sayan/Sayan/Study/Project_resume/new_proj
+
+# Download Ubuntu 24.04 arm64 cloud image (~400 MB)
 curl -LO https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-arm64.img
-qemu-img resize noble-server-cloudimg-arm64.img +10G
-./scripts/make_seed.sh      # builds seed.iso from cloud-init config
+
+# Expand the disk to 20 GB (driver build tools need space)
+qemu-img resize noble-server-cloudimg-arm64.img +18G
+
+# Build the cloud-init seed ISO (sets up login credentials)
+bash scripts/make_seed.sh
+# Creates: seed.iso
 ```
 
-### Step 2 — Boot the VM
+---
+
+### Stage 2 — Boot the VM
+
+Open a **dedicated terminal tab** for the VM (it takes over the terminal):
 
 ```bash
-./scripts/boot_qemu.sh      # serial console appears in this terminal
+cd /Users/sayan/Sayan/Study/Project_resume/new_proj
+bash scripts/boot_qemu.sh
 ```
 
-### Step 3 — SSH in and set up the guest
+**What you'll see:**
+```
+[  OK  ] Started OpenSSH server daemon.
+Ubuntu 24.04 LTS ubuntu ttyAMA0
 
-```bash
-# New terminal tab:
-ssh -p 2222 ubuntu@localhost          # password: driver
-
-# Copy setup script and run it:
-scp -P 2222 scripts/mount_share.sh ubuntu@localhost:~
-bash ~/mount_share.sh                 # installs gcc, kernel headers, pciutils, socat
+ubuntu login:
 ```
 
-### Step 4 — Copy source and build the driver
+Login: `ubuntu` / Password: `driver`
+
+> The VM boots with `-device edu` — this is the virtual PCIe device
+> your driver will control. Verify it with: `lspci | grep 1234`
+> Output should show: `00:02.0 Unclassified device [00ff]: QEMU 1234:11e8`
+
+---
+
+### Stage 3 — SSH in (use this instead of the serial console)
+
+Open a **new terminal tab** on macOS:
 
 ```bash
-scp -P 2222 -r edu-driver    ubuntu@localhost:~/driver-workspace/
-scp -P 2222 -r uart-protocol ubuntu@localhost:~/driver-workspace/
+ssh -p 2222 ubuntu@localhost      # password: driver
+```
 
-# Inside guest:
-cd ~/driver-workspace/edu-driver
+---
+
+### Stage 4 — Install Build Tools (one time, inside VM)
+
+```bash
+# Inside the guest:
+sudo apt update
+sudo apt install -y \
+    build-essential \
+    linux-headers-$(uname -r) \
+    liburing-dev \
+    libbpf-dev \
+    clang llvm bpftool \
+    bpftrace \
+    socat pciutils
+
+# Verify the EDU device is visible to Linux:
+lspci -n | grep "1234:11e8"
+# Expected: 00:02.0 Class 00ff: 1234:11e8
+```
+
+---
+
+### Stage 5 — Copy Project Source into VM
+
+Run this on **macOS** (not inside the VM):
+
+```bash
+cd /Users/sayan/Sayan/Study/Project_resume/new_proj
+
+scp -P 2222 -r edu-driver      ubuntu@localhost:~/
+scp -P 2222 -r uart-protocol   ubuntu@localhost:~/
+scp -P 2222 -r ebpf-profiler   ubuntu@localhost:~/
+```
+
+---
+
+### Stage 6 — Build and Load the Kernel Driver
+
+```bash
+# Inside the guest:
+cd ~/edu-driver
 make
 sudo insmod edu.ko
-dmesg | tail -20
+
+# Verify it loaded:
+dmesg | tail -8
 ```
 
-Expected `dmesg` output:
+**Expected `dmesg` output:**
 ```
 edu 0000:00:02.0: selftest: ID = 0x010000ed [OK]
 edu 0000:00:02.0: selftest: liveness 0xdeadbeef → 0x21524110 [OK]
 edu 0000:00:02.0: selftest: 5! = 120 [OK]
-edu 0000:00:02.0: EDU driver loaded: BAR0@..., MSI IRQ=..., DMA buf phys=0x...
+edu 0000:00:02.0: EDU driver loaded: BAR0@0xffff..., MSI IRQ=33, DMA buf phys=0x...
 ```
 
-### Step 5 — Run userspace tests
+```bash
+# Verify char device exists:
+ls -la /dev/edu0
+
+# Verify MSI interrupt is registered:
+cat /proc/interrupts | grep edu
+# Shows: 33:   0   PCI-MSI 524288-edge   edu
+
+# Verify BAR0 is reserved:
+cat /proc/iomem | grep edu
+```
+
+---
+
+### Stage 7 — Run ioctl Tests (liveness + factorial + DMA + mmap)
 
 ```bash
+# Inside guest, in ~/edu-driver:
 gcc -Wall -O2 -o edu_test edu_test.c
 sudo ./edu_test
 ```
 
-Expected output:
+**Expected output:**
 ```
+=== EDU driver userspace tests ===
+
 [PASS] liveness: wrote 0xdeadbeef, got 0x21524110
 [PASS] factorial: 1! = 1
 [PASS] factorial: 5! = 120
@@ -297,25 +386,187 @@ Expected output:
 [PASS] factorial: 10! = 3628800
 [PASS] factorial: 12! = 479001600
 [PASS] DMA round-trip (RAM→device→RAM memcmp verified)
-[PASS] mmap: 4096-byte DMA buffer mapped at 0x..., 0xAB pattern survives zero-copy round-trip
+[PASS] mmap: 4096-byte DMA buffer mapped at 0x7f..., 0xAB pattern survives zero-copy round-trip
+
 All tests passed.
 ```
 
-### Step 6 — Run UART tests (inside guest)
+---
+
+### Stage 8 — Run io_uring Async Tests
 
 ```bash
-cd ~/driver-workspace/uart-protocol
+# Inside guest, in ~/edu-driver:
+gcc -Wall -O2 -o edu_uring_test edu_uring_test.c -luring
+sudo ./edu_uring_test
+```
+
+**Expected output:**
+```
+═══════════════════════════════════════════════════════
+  EDU Driver — io_uring async interface tests
+═══════════════════════════════════════════════════════
+
+[INFO] DMA started — thread is FREE while hardware runs. Doing other work...
+[INFO] ...finished 1M iterations (sum=499999500000) while DMA was in flight.
+[PASS] async DMA via io_uring: CQE res=0, total latency=143 µs
+[PASS] async factorial(7) = 5040 via io_uring
+[PASS] async factorial(10) = 3628800 via io_uring
+
+┌─────────────────────────────────────────────────┐
+│  DMA throughput comparison (10 iterations each)  │
+├─────────────────────────────────────────────────┤
+│  ioctl:    avg latency =   187 µs per op        │
+│  io_uring: avg latency =   134 µs per op        │
+│  io_uring is faster (lower syscall overhead)    │
+└─────────────────────────────────────────────────┘
+
+All io_uring tests passed.
+```
+
+> **What to point out:** The `[INFO]` lines prove the thread was NOT blocked
+> while DMA ran. With ioctl, those 1M iterations would only run AFTER DMA finished.
+
+---
+
+### Stage 9 — Run eBPF Interrupt Latency Profiler
+
+**Option A — bpftrace (instant, no compilation):**
+
+Open **two terminal tabs** into the VM simultaneously.
+
+**Tab 1 — Start the profiler:**
+```bash
+# Inside guest:
+sudo bpftrace ~/ebpf-profiler/edu_latency.bt
+```
+
+**Tab 2 — Drive the device (generates interrupts):**
+```bash
+# Inside guest:
+for i in $(seq 1 20); do sudo ./edu-driver/edu_test > /dev/null; done
+```
+
+**Expected profiler output (every 5 seconds):**
+```
+════════════════════════════════════════════════════════
+  EDU Interrupt Latency Profile  (5-second snapshot)
+════════════════════════════════════════════════════════
+
+[1] ISR execution time (µs):
+[0, 1)   ████████████████████  45
+[1, 2)   ████████              18
+[2, 4)   ████                   9
+
+[2] DMA ioctl round-trip latency (µs):
+[64, 128)   █████████████████  38
+[128, 256)  ████████           20
+
+[3] Interrupt → wakeup latency (µs):
+[4, 8)   █████████████████     41
+[8, 16)  ████████              22
+```
+
+**Option B — Full libbpf profiler with P50/P95/P99:**
+
+```bash
+# Inside guest:
+cd ~/ebpf-profiler
+
+# Generate vmlinux.h from running kernel BTF:
+sudo bpftool btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h
+
+# Build:
 make
 
-# Terminal A inside guest:
-socat -d -d pty,raw,echo=0 pty,raw,echo=0
-# Note the two /dev/pts/N paths printed
-
-# Terminal B inside guest:
-sudo ./uart_test /dev/pts/2 /dev/pts/3
+# Run (samples every 3 seconds):
+sudo ./edu_latency -i 3
 ```
 
 ---
+
+### Stage 10 — Run UART Protocol Tests
+
+**Option A — Run on macOS directly** (no VM needed, pure C):
+
+```bash
+# On macOS (this terminal, no SSH):
+cd /Users/sayan/Sayan/Study/Project_resume/new_proj/uart-protocol
+make
+
+# Create a virtual serial loopback pair:
+socat -d -d pty,raw,echo=0 pty,raw,echo=0 &
+# Note the two /dev/ttys.XXX paths printed, e.g. /dev/ttys003 and /dev/ttys004
+
+./uart_test /dev/ttys003 /dev/ttys004
+```
+
+**Expected output:**
+```
+[PASS] loopback: "Hello, UART!" round-trip OK
+[PASS] byte stuffing: 0x7E and 0x7D correctly escaped/unescaped
+[PASS] corruption detection: bad checksum detected and reported
+[PASS] resync: receiver recovered after mid-stream start
+All UART tests passed.
+```
+
+**Option B — Reliable UART with ACK/NACK:**
+
+```bash
+cd /Users/sayan/Sayan/Study/Project_resume/new_proj/uart-protocol/reliable
+make
+
+socat -d -d pty,raw,echo=0 pty,raw,echo=0 &
+# e.g. /dev/ttys005 and /dev/ttys006
+
+./uart_reliable_test /dev/ttys005 /dev/ttys006
+```
+
+**Expected output:**
+```
+[PASS] basic round-trip: message received correctly
+[PASS] multi-frame: 5 frames delivered with incrementing sequence numbers
+
+─── Reliable UART session statistics ───────────────
+  Frames sent:        6
+  Retransmits:        0  (0% loss rate)
+  Frames received:    6
+  Duplicates dropped: 0
+────────────────────────────────────────────────────
+```
+
+---
+
+### Stage 11 — Unload and Verify Clean Teardown
+
+```bash
+# Inside guest:
+sudo rmmod edu
+dmesg | tail -3
+# Expected: "EDU driver unloaded"
+
+# Verify /dev/edu0 is gone:
+ls /dev/edu0
+# ls: cannot access '/dev/edu0': No such file or directory
+
+# Reload and repeat tests:
+sudo insmod edu.ko && sudo ./edu_test
+```
+
+---
+
+### Full Demo Checklist
+
+| Component | What runs where | Command |
+|---|---|---|
+| Kernel driver | Inside VM | `sudo insmod edu.ko` |
+| ioctl tests | Inside VM | `sudo ./edu_test` |
+| io_uring async | Inside VM | `sudo ./edu_uring_test` |
+| eBPF profiler (bpftrace) | Inside VM | `sudo bpftrace edu_latency.bt` |
+| eBPF profiler (libbpf) | Inside VM | `sudo ./edu_latency` |
+| UART base framing | macOS (no VM) | `./uart_test /dev/ttys003 /dev/ttys004` |
+| UART reliable transport | macOS (no VM) | `./uart_reliable_test /dev/ttys005 /dev/ttys006` |
+
 
 ## EDU Device Register Map
 
