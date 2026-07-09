@@ -2,6 +2,11 @@
 
 <div align="center">
 
+[![Platform Compatibility](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20VM-brightgreen)](https://github.com/Necromancer0912/Linux-PCIe-driver-DMA-iouring-ebpf)
+[![Kernel Compatibility](https://img.shields.io/badge/kernel-%E2%89%A5%205.19-blue)](https://github.com/Necromancer0912/Linux-PCIe-driver-DMA-iouring-ebpf)
+[![Language](https://img.shields.io/badge/language-C-orange)](https://github.com/Necromancer0912/Linux-PCIe-driver-DMA-iouring-ebpf)
+[![License](https://img.shields.io/badge/license-GPLv2-red)](https://github.com/Necromancer0912/Linux-PCIe-driver-DMA-iouring-ebpf)
+
 **A low-level Linux systems project built from scratch on Apple Silicon**
 
 *Kernel-space PCIe driver · MSI interrupt handling · Coherent DMA · Custom serial framing protocol*
@@ -16,20 +21,20 @@ This project is a **Linux kernel-mode device driver** written entirely from scra
 
 Alongside it, we implement a **custom link-layer framing protocol** over UART — the same class of protocol used in embedded communication stacks (PPP, HDLC, Modbus) — to demonstrate serial communication design from first principles.
 
-No pre-written driver frameworks. No libraries. Every line of kernel code is handwritten.
+> [!NOTE]
+> This driver is implemented entirely in standard kernel-space C without any pre-written driver frameworks or wrapper libraries. Every register read, interrupt acknowledgement, and page mapping is handcrafted.
 
 ---
 
-## Why? — Motivation
+## Motivation
 
-Modern software engineering increasingly abstracts away the hardware. Most developers never write a line of code that runs in kernel space, never touch a DMA buffer, and never implement their own interrupt handler. But the engineers who *can* do this — who understand the full stack from silicon to syscall — are the ones who can debug what nobody else can, design what nobody else can, and go where others can't.
+Modern software engineering increasingly abstracts away the hardware. Most developers never write code that runs in kernel space, never touch a DMA buffer, and never implement their own interrupt handler. But understanding the full stack from silicon to syscall is a key systems programming skill.
 
-**Specific goals:**
-- Understand the complete lifecycle of a PCI device driver: probe → resource allocation → interrupt registration → DMA → teardown
-- Learn the Linux kernel's DMA API and why cache coherency matters
-- Understand the tradeoffs between polling, interrupt-driven I/O, and DMA (latency vs CPU utilization)
-- Design a serial framing protocol from scratch — byte stuffing, checksums, resync — and understand why each piece exists
-- Build resume-worthy, interviewer-defensible systems work: code you can explain line by line under questioning
+### Core Learning Objectives
+- **Device Lifecycle:** Master the complete lifecycle of a PCI device driver (`probe` → resource allocation → interrupt registration → DMA → teardown).
+- **Memory Management:** Learn the Linux kernel's DMA API, cache coherency protocols, and zero-copy user-kernel space mapping (`mmap`).
+- **Asynchronous Execution:** Understand the performance tradeoffs between polling, interrupt-driven I/O, and asynchronous kernel-bypass engines like `io_uring`.
+- **Protocol Design:** Design a serial framing protocol from scratch (byte stuffing, checksumming, resync logic) to understand how low-level link layers guarantee data integrity.
 
 ---
 
@@ -84,9 +89,9 @@ flowchart TB
     edu_dev --- DevInternals
 ```
 
-**Why Apple Silicon + QEMU + HVF?**
-
-Running arm64 Linux inside QEMU with HVF (Apple Hypervisor.framework) gives near-native execution speed on M4 — the kernel compiles fast, module load/unload cycles are instant, and the entire environment is self-contained on one machine with no external hardware. The driver code itself is architecture-independent C; the only thing that changes between this and a real PCIe card is the silicon under the BAR.
+> [!TIP]
+> **Why Apple Silicon + QEMU + HVF?**
+> Running arm64 Linux inside QEMU with HVF (Apple Hypervisor.framework) gives near-native execution speed on Apple M-series chips — the kernel compiles fast, module load/unload cycles are instant, and the entire environment is self-contained on one machine with no external hardware. The driver code itself is architecture-independent C; the only thing that changes between this and a real PCIe card is the silicon under the BAR.
 
 ---
 
@@ -141,23 +146,21 @@ Running arm64 Linux inside QEMU with HVF (Apple Hypervisor.framework) gives near
 
 ## What We Achieved — Outcomes
 
-```
-✓  Written a Linux PCI kernel driver entirely from scratch
-✓  Mapped and accessed PCI BAR0 MMIO registers from kernel space
-✓  Registered an MSI interrupt vector and written an ISR
-✓  Performed coherent DMA transfers in both directions, verified with memcmp
-✓  Built a userspace ↔ kernel interface via char device and ioctl
-✓  Designed a serial framing protocol with byte stuffing and error recovery
-✓  Deployed everything in a reproducible, HVF-accelerated arm64 Linux VM on macOS
-✓  Documented debugging stories — the bugs found and how they were fixed
-```
+- **Handwritten Linux PCI kernel driver** developed completely from scratch.
+- **BAR0 memory-mapped I/O (MMIO)** registers read/write verified.
+- **MSI interrupt vector** allocation and interrupt service routine (ISR) handler registration.
+- **Coherent and streaming DMA transfers** running bidirectionally, verified by memory comparison.
+- **Character device interface** with customized `ioctl` API commands and `mmap` zero-copy page mapping.
+- **Link-layer framing protocol** for serial lines incorporating byte stuffing, error detection, and frame alignment recovery.
+- **Virtualization pipeline** configuration running local VMs via QEMU with native Hypervisor acceleration on macOS.
 
-**Bugs found and understood (these are what interviewers actually ask about):**
-
-- Missing `pci_set_master()` → DMA registers accepted writes but zero data moved *(bus-mastering must be explicitly enabled)*
-- Missing ISR acknowledge write to `0x64` → interrupt storm, guest locked up *(every IRQ controller requires explicit EOI)*
-- `IRQF_SHARED` replaced with `pci_alloc_irq_vectors(PCI_IRQ_MSI)` → cleaner, per-device vector, matches how `edu` device actually fires interrupts internally
-- 9p file share `security_model=passthrough` → all files unreadable in guest *(host UID 501 doesn't map to guest — use `mapped` mode)*
+> [!IMPORTANT]
+> **Key Debugging Insights (Interviewer-grade answers):**
+> 
+> - **Missing `pci_set_master()`:** The DMA controller initially silently refused to run. This was debugged by realizing that bus-mastering must be explicitly enabled in the device configuration space via `pci_set_master(pdev)`.
+> - **Interrupt Storms:** The guest CPU locked up on the first factorial calculation due to missing register-level interrupt acknowledgment. We fixed this by ensuring the ISR performs a write to the `0x64` (`EDU_REG_INTR_ACK`) offset to signal End of Interrupt (EOI) to the hardware.
+> - **Interrupt Vector Conflict:** We replaced deprecated `IRQF_SHARED` setup with explicit `pci_alloc_irq_vectors(PCI_IRQ_MSI)`. This gives the device a clean dedicated IRQ line rather than a shared legacy line.
+> - **Mount Directory Permissions:** A `security_model=passthrough` mounting issue made workspace files unreadable in the guest OS. Solved by shifting QEMU folder sharing options to the `mapped` directory security model.
 
 ---
 
@@ -435,8 +438,9 @@ sudo ./edu_uring_test
 All io_uring tests passed.
 ```
 
-> **What to point out:** The `[INFO]` lines prove the thread was NOT blocked
-> while DMA ran. With ioctl, those 1M iterations would only run AFTER DMA finished.
+> [!NOTE]
+> **Understanding the Async Nature:**
+> The `[INFO]` logs demonstrate that the userspace thread remains unblocked and performs CPU execution (the 1M iterations loop) while the DMA transfer runs asynchronously inside QEMU's virtual hardware. Under standard `ioctl`, the calling thread blocks inside the kernel immediately and cannot execute any userspace instructions until the hardware completes.
 
 ---
 
