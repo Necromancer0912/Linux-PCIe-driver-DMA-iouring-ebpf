@@ -36,41 +36,34 @@ Modern software engineering increasingly abstracts away the hardware. Most devel
 ## How We Built It — Architecture
 
 ```
-╔══════════════════════════════════════════════════════════════════════════╗
-║  macOS Host  ·  Apple M4 Air  ·  Apple Hypervisor.framework (HVF)      ║
-║                                                                          ║
-║  ┌──────────────────────────────────────────────────────────────────┐  ║
-║  │  QEMU  (HVF-accelerated · arm64 · near-native speed)             │  ║
-║  │                                                                   │  ║
-║  │  ┌─────────────────────────────────────────────────────────┐    │  ║
-║  │  │  Ubuntu 24.04 arm64 Guest                                │    │  ║
-║  │  │                                                          │    │  ║
-║  │  │   ┌──────────────────┐      ┌────────────────────────┐  │    │  ║
-║  │  │   │   Kernel Space   │      │  QEMU Virtual PCI Bus  │  │    │  ║
-║  │  │   │                  │      │                        │  │    │  ║
-║  │  │   │  ┌────────────┐  │ MMIO │  ┌──────────────────┐  │  │    │  ║
-║  │  │   │  │  edu.ko    │◄─┼──────┼─►│   edu device     │  │  │    │  ║
-║  │  │   │  │            │  │      │  │  ┌────────────┐  │  │  │    │  ║
-║  │  │   │  │ PCI probe  │  │ MSI  │  │  │ MMIO regs  │  │  │  │    │  ║
-║  │  │   │  │ BAR map    │◄─┼──────┼──│  │ Factorial  │  │  │  │    │  ║
-║  │  │   │  │ MSI vector │  │      │  │  │ ALU        │  │  │  │    │  ║
-║  │  │   │  │ DMA engine │◄─┼──────┼─►│  │ DMA engine │  │  │  │    │  ║
-║  │  │   │  │ wait_queue │  │      │  │  │ 4KB buffer │  │  │  │    │  ║
-║  │  │   │  │ /dev/edu0  │  │      │  └──────────────────┘  │  │    │  ║
-║  │  │   │  └─────┬──────┘  │      └────────────────────────┘  │    │  ║
-║  │  │   │        │ ioctl   │                                   │    │  ║
-║  │  │   └────────┼─────────┘                                   │    │  ║
-║  │  │            │                                             │    │  ║
-║  │  │   ┌────────▼────────┐    ┌──────────────────────────┐   │    │  ║
-║  │  │   │  Userspace      │    │  uart_test               │   │    │  ║
-║  │  │   │  edu_test       │    │  socat pty pair /        │   │    │  ║
-║  │  │   │  (liveness,     │    │  /dev/ttyAMA1 loopback   │   │    │  ║
-║  │  │   │   factorial,    │    │  byte-stuffed frames     │   │    │  ║
-║  │  │   │   DMA verify)   │    │  XOR checksum + resync   │   │    │  ║
-║  │  │   └─────────────────┘    └──────────────────────────┘   │    │  ║
-║  │  └─────────────────────────────────────────────────────────┘    │  ║
-║  └──────────────────────────────────────────────────────────────────┘  ║
-╚══════════════════════════════════════════════════════════════════════════╝
+  macOS  ·  Apple M4 Air  ·  Hypervisor.framework (HVF)
+ ┌──────────────────────────────────────────────────────────────────────┐
+ │  QEMU  ·  HVF-accelerated  ·  arm64  ·  near-native speed           │
+ │                                                                      │
+ │  ┌─────────────────── Ubuntu 24.04 arm64 ────────────────────────┐  │
+ │  │                                                               │  │
+ │  │  ┌─────────────────────────┐     ┌──────────────────────────┐ │  │
+ │  │  │  Kernel Space           │     │  QEMU Virtual PCIe Bus   │ │  │
+ │  │  │                         │     │                          │ │  │
+ │  │  │  edu.ko                 │◄────┤  edu device              │ │  │
+ │  │  │  ├─ pci_probe / BAR map │MMIO►│  ├─ MMIO registers       │ │  │
+ │  │  │  ├─ pci_alloc_irq (MSI) │◄MSI─│  ├─ Factorial ALU        │ │  │
+ │  │  │  ├─ ISR + wait_queue    │◄DMA►│  ├─ DMA engine           │ │  │
+ │  │  │  ├─ dma_alloc_coherent  │     │  └─ 4 KB onboard buffer  │ │  │
+ │  │  │  ├─ dma_mmap_coherent   │     └──────────────────────────┘ │  │
+ │  │  │  └─ /dev/edu0           │                                   │  │
+ │  │  └────────────┬────────────┘                                   │  │
+ │  │               │                                                │  │
+ │  │     ioctl  ·  io_uring (URING_CMD)  ·  mmap (zero-copy)       │  │
+ │  │               │                                                │  │
+ │  │  ┌────────────▼────────────┐     ┌──────────────────────────┐ │  │
+ │  │  │  Userspace              │     │  UART Protocol           │ │  │
+ │  │  │  ├─ edu_test            │     │  ├─ uart_test             │ │  │
+ │  │  │  ├─ edu_uring_test      │     │  ├─ uart_reliable_test    │ │  │
+ │  │  │  └─ edu_latency (eBPF)  │     │  └─ socat pty loopback    │ │  │
+ │  │  └─────────────────────────┘     └──────────────────────────┘ │  │
+ │  └───────────────────────────────────────────────────────────────┘  │
+ └──────────────────────────────────────────────────────────────────────┘
 ```
 
 **Why Apple Silicon + QEMU + HVF?**
@@ -609,15 +602,6 @@ sudo insmod edu.ko && sudo rmmod edu && dmesg | tail -5
 # Boot QEMU with -s -S, then from macOS:
 # gdb vmlinux → target remote :1234
 ```
-
----
-
-## Resume Bullet
-
-> **PCIe Device Driver Development — Linux Kernel, QEMU/arm64**
-> Wrote a Linux kernel driver from scratch for a memory-mapped PCI device: BAR mapping, MMIO register access, MSI interrupt handling with `wait_queue`-based completion, bidirectional coherent DMA verified with `memcmp`, and `mmap` zero-copy userspace buffer access (`dma_mmap_coherent`). Exposed the device via a char device with both synchronous ioctl and asynchronous `io_uring` (`IORING_OP_URING_CMD`) interfaces — ISR completion deferred through a workqueue to `io_uring_cmd_done`. Profiled interrupt latency with a CO-RE eBPF program (kprobes on `edu_isr` + `finish_wait`, P50/P95/P99 histograms via libbpf). Implemented a checksummed byte-stuffed UART framing protocol and a stop-and-wait reliable transport (DATA/ACK/NACK, sequence numbers, retransmit). Deployed in an HVF-accelerated arm64 QEMU environment on Apple Silicon.
-
----
 
 ## Authors
 
