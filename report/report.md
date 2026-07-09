@@ -48,6 +48,17 @@ Phase 6: DMA — bidirectional, verified
   └─ device→RAM: DMA device's 0x40000 into a second buffer
   └─ memcmp(buf1, buf2) == 0 → PASS
   └─ IRQ on completion (EDU_DMA_IRQ_ON_DONE) — same wait_queue as factorial
+
+Phase 7: Asynchronous io_uring Integration
+  └─ Added support for `IORING_OP_URING_CMD` via `.uring_cmd` file operation
+  └─ Created deferred completion pipeline: ISR hard-IRQ -> workqueue -> `io_uring_cmd_done`
+  └─ Implemented async DMA round-trip and async factorial commands
+  └─ Verified: userspace thread performs CPU computation while DMA runs asynchronously
+
+Phase 8: eBPF Interrupt and Latency Profiling
+  └─ Instrumented kernel driver entry/exit hooks using kprobes and kretprobes
+  └─ Measured ISR execution duration, DMA ioctl round-trip, and scheduler wake-up latency
+  └─ Implemented both bpftrace script and full CO-RE libbpf binary with log2 histograms
 ```
 
 ### 2.2 Key design decisions
@@ -150,9 +161,68 @@ The corruption test deliberately writes a raw frame with a flipped checksum bit 
 | UART | USB-TTL adapter on macOS via termios | Same termios API on embedded Linux; may need RS-485 direction control GPIO |
 | Debugging | dmesg + QEMU monitor | JTAG, logic analyser, oscilloscope for physical signal verification |
 
+
 ---
 
-## 6. Resume Bullet (Final)
+## 6. Advanced Extensions
 
-> **PCIe/DMA Kernel Driver Development (Linux, QEMU/aarch64)**  
-> Wrote a Linux kernel driver for a memory-mapped PCI device from scratch on a Mac M4 Air using QEMU HVF-accelerated aarch64 virtualization — BAR mapping, MMIO register access, interrupt-driven completion with `wait_queue`, and bidirectional DMA with coherent buffer allocation and `memcmp` verification — exposed via a custom char device and ioctl interface. Implemented a checksummed, byte-stuffed UART framing protocol in C using termios, including resync logic and corruption detection, tested via loopback.
+### 6.1 io_uring Asynchronous Passthrough
+
+To bypass the synchronous blocking limitations of standard `ioctl` files, we implemented modern Linux `io_uring` passthrough support (`IORING_OP_URING_CMD`).
+
+#### The Concurrency Challenge
+The primary system design challenge when interfacing `io_uring` with a hardware device driver is **interrupt safety**. When the hardware completes a DMA or ALU calculation, it asserts the PCIe interrupt line, triggering the CPU's hard-IRQ handler (`edu_isr`).
+
+However, standard kernel design dictates that the `io_uring` completion function `io_uring_cmd_done()` **cannot be executed from a hard-IRQ context** because it performs complex scheduling, context-saving, and locks page mappings which could cause deadlocks or trigger a kernel panic.
+
+#### The Workqueue Pipeline
+To solve this, we deferred the completion processing out of the hard-IRQ path and into a kernel-managed workqueue running in process context:
+
+```
+[ PCIe Device ] ──(Interrupt)──► [ edu_isr (Hard-IRQ) ]
+                                         │
+                                   (Schedule)
+                                         ▼
+[ Userspace CQE Woken ] ◄──(Process Context)── [ edu_uring_complete (Workqueue) ]
+```
+
+1. **Submission (`edu_uring_cmd`):** Userspace prepares a custom SQE payload containing the operation parameters and submits it to the ring. The driver receives this in `.uring_cmd`, programs the hardware registers, records the request pointer as pending, and immediately yields control back to the caller by returning `-EIOCBQUEUED`. The user thread is free to run other tasks.
+2. **Detection (`edu_isr`):** When the hardware DMA engine finishes transferring data, it raises the MSI interrupt. The ISR catches this, identifies that an asynchronous `io_uring` command is pending, and schedules `uring_complete_work`.
+3. **Execution (`edu_uring_complete`):** The workqueue handler runs in a separate thread context where blocking is safe. It grabs the pending command data under a mutex lock, executes the final verification step, and completes the lifecycle by calling `io_uring_cmd_done()`. Userspace is then notified via a CQE.
+
+---
+
+### 6.2 eBPF Interrupt and Scheduler Profiling
+
+We instrumented the driver to measure latency at three key points under load, implementing both a lightweight `bpftrace` diagnostic script and a structured libbpf-based C binary using Compile-Once, Run-Everywhere (CO-RE) techniques.
+
+```
+       [ Userspace ioctl/uring Submission ]
+                        │
+                        ├─► Probe: edu_ioctl entry (Record T1)
+                        ▼
+                 [ Driver ISR ]
+                        │
+                        ├─► Probe: edu_isr entry (Record T2)
+                        ├─► Probe: edu_isr exit  (Measure ISR Duration: T_isr = exit - T2)
+                        ▼
+              [ wake_up() executed ]
+                        │
+                        ├─► Probe: __wake_up_common (Record T3)
+                        ▼
+            [ Thread wakes up & resumes ]
+                        │
+                        ├─► Probe: finish_wait (Measure wake-up latency: T_sched = resume - T3)
+                        ▼
+       [ Userspace ioctl/uring Completion ]
+                        │
+                        ├─► Probe: edu_ioctl exit (Measure Round-trip: T_rt = exit - T1)
+```
+
+#### Monitored Probes
+- **kprobe / kretprobe on `edu_isr`:** Records the total execution time of the hard-IRQ handler. A lean handler must complete in less than 5 microseconds to ensure system responsiveness and prevent CPU starvation.
+- **kprobe / kretprobe on `edu_ioctl`:** Traces the total elapsed round-trip time of a DMA transfer from user space initiation to driver return.
+- **kprobe on `__wake_up_common` and `finish_wait`:** Tracks scheduler latency. By comparing when the ISR calls the wake-up notifier to when the waiting thread actually executes its next instruction, we measure the system's task scheduling overhead under load.
+
+#### Data Aggregation
+The BPF programs aggregate timestamps locally in the kernel using high-performance hash tables (`BPF_MAP_TYPE_HASH`) and log2 arrays (`BPF_MAP_TYPE_ARRAY`). The userspace manager polls these maps, calculates cumulative metrics, and renders detailed ASCII bar charts showing latency distributions and P50/P95/P99 percentiles.
