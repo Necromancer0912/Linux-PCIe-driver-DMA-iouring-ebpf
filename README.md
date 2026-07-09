@@ -35,35 +35,53 @@ Modern software engineering increasingly abstracts away the hardware. Most devel
 
 ## How We Built It — Architecture
 
-```
-  macOS  ·  Apple M4 Air  ·  Hypervisor.framework (HVF)
- ┌──────────────────────────────────────────────────────────────────────┐
- │  QEMU  ·  HVF-accelerated  ·  arm64  ·  near-native speed           │
- │                                                                      │
- │  ┌─────────────────── Ubuntu 24.04 arm64 ────────────────────────┐  │
- │  │                                                               │  │
- │  │  ┌─────────────────────────┐     ┌──────────────────────────┐ │  │
- │  │  │  Kernel Space           │     │  QEMU Virtual PCIe Bus   │ │  │
- │  │  │                         │     │                          │ │  │
- │  │  │  edu.ko                 │◄────┤  edu device              │ │  │
- │  │  │  ├─ pci_probe / BAR map │MMIO►│  ├─ MMIO registers       │ │  │
- │  │  │  ├─ pci_alloc_irq (MSI) │◄MSI─│  ├─ Factorial ALU        │ │  │
- │  │  │  ├─ ISR + wait_queue    │◄DMA►│  ├─ DMA engine           │ │  │
- │  │  │  ├─ dma_alloc_coherent  │     │  └─ 4 KB onboard buffer  │ │  │
- │  │  │  ├─ dma_mmap_coherent   │     └──────────────────────────┘ │  │
- │  │  │  └─ /dev/edu0           │                                   │  │
- │  │  └────────────┬────────────┘                                   │  │
- │  │               │                                                │  │
- │  │     ioctl  ·  io_uring (URING_CMD)  ·  mmap (zero-copy)       │  │
- │  │               │                                                │  │
- │  │  ┌────────────▼────────────┐     ┌──────────────────────────┐ │  │
- │  │  │  Userspace              │     │  UART Protocol           │ │  │
- │  │  │  ├─ edu_test            │     │  ├─ uart_test             │ │  │
- │  │  │  ├─ edu_uring_test      │     │  ├─ uart_reliable_test    │ │  │
- │  │  │  └─ edu_latency (eBPF)  │     │  └─ socat pty loopback    │ │  │
- │  │  └─────────────────────────┘     └──────────────────────────┘ │  │
- │  └───────────────────────────────────────────────────────────────┘  │
- └──────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph MacOS ["macOS Host (Apple Silicon M4 Air + HVF)"]
+        subgraph QEMU ["QEMU VM (arm64)"]
+            subgraph Ubuntu ["Ubuntu 24.04 Guest OS"]
+                subgraph Userspace ["Userspace Layer"]
+                    edu_test["edu_test (ioctl / mmap)"]
+                    edu_uring["edu_uring_test (io_uring)"]
+                    ebpf["edu_latency (eBPF Profiler)"]
+                end
+
+                subgraph Kernel ["Kernel Space Layer"]
+                    driver["edu.ko (Custom PCIe Driver)"]
+                    char_dev["/dev/edu0 (Char Device Node)"]
+                end
+            end
+
+            subgraph PCIe ["PCIe Device Emulation"]
+                edu_dev["QEMU virtual 'edu' Device (1234:11e8)"]
+                subgraph DevInternals ["Device Internals"]
+                    registers["MMIO Registers (BAR0)"]
+                    factorial_alu["Factorial ALU"]
+                    dma_ctrl["DMA Controller"]
+                end
+            end
+        end
+        
+        subgraph UART_Protocol ["UART Framing Protocol (Host / Guest)"]
+            socat["socat virtual PTY loopback"]
+            uart_test["uart_test (Byte stuffing, checksum)"]
+            reliable_test["uart_reliable_test (DATA/ACK/NACK)"]
+            
+            uart_test <--> socat
+            reliable_test <--> socat
+        end
+    end
+
+    %% Connections
+    edu_test -.->|ioctl & mmap| char_dev
+    edu_uring -.->|io_uring passthrough| char_dev
+    ebpf -.->|kprobes & return probes| driver
+    char_dev ===> driver
+    
+    driver <===>|BAR0 MMIO & DMA| edu_dev
+    edu_dev --x|MSI Interrupt| driver
+    
+    edu_dev --- DevInternals
 ```
 
 **Why Apple Silicon + QEMU + HVF?**
