@@ -204,37 +204,42 @@ This project directly mirrors production engineering work in:
 ## Repository Structure
 
 ```
-new_proj/
-├── edu-driver/
-│   ├── edu.h                ← registers, bit defs, ioctl cmds, io_uring req struct
-│   ├── edu.c                ← kernel module: probe, MMIO, MSI, DMA, mmap, io_uring
-│   ├── edu_test.c           ← ioctl tests: liveness, factorial×5, DMA, mmap
-│   ├── edu_uring_test.c     ← io_uring tests: async DMA, async factorial, ioctl vs ring bench
-│   └── Makefile
-├── uart-protocol/
-│   ├── uart_frame.h         ← base frame format spec + API
-│   ├── uart_frame.c         ← send_frame, recv_frame, byte-stuffing, resync
-│   ├── uart_test.c          ← 4-test harness
-│   ├── Makefile
-│   └── reliable/
-│       ├── uart_reliable.h      ← reliable transport API + DATA/ACK/NACK spec
-│       ├── uart_reliable.c      ← seq numbers, retransmit, dup detection
-│       ├── uart_reliable_test.c ← round-trip, multi-frame, stats
-│       └── Makefile
-├── ebpf-profiler/
-│   ├── edu_latency.bt       ← bpftrace script (quickest to run, no compilation)
-│   ├── edu_latency.bpf.c    ← CO-RE BPF kernel program (kprobes + histograms)
-│   ├── edu_latency.c        ← libbpf loader: attaches probes, prints P50/P95/P99
-│   └── Makefile             ← vmlinux.h gen, clang BPF compile, bpftool skeleton
-├── scripts/
-│   ├── boot_qemu.sh         ← boots Ubuntu 24.04 arm64 VM with HVF + EDU device
-│   ├── make_seed.sh         ← builds cloud-init seed.iso (run once on macOS)
-│   ├── mount_share.sh       ← in-guest setup: apt install, lspci verify
-│   └── cloud-init/
-├── buildroot-config/
-│   └── edu_defconfig
-└── report/
-    └── report.md            ← architecture, debugging stories, design rationale
+.
+├── edu-driver/              # PCIe Kernel Driver & userspace test suites
+│   ├── Makefile             # In-guest kernel module build script
+│   ├── edu.h                # Register maps, IOCTL definitions, and io_uring structures
+│   ├── edu.c                # Custom PCIe driver (MMIO, MSI, DMA, mmap, io_uring)
+│   ├── edu_test.c           # Userspace verification suite (sync IOCTL / mmap tests)
+│   └── edu_uring_test.c     # Userspace async tests (io_uring passthrough / throughput bench)
+│
+├── ebpf-profiler/           # Kernel interrupt & scheduler profiling tools
+│   ├── Makefile             # BPF compilation and bpftool skeleton generation
+│   ├── edu_latency.bt       # bpftrace latency profiling script (zero-compile)
+│   ├── edu_latency.bpf.c    # CO-RE eBPF kernel program (kprobes on ISR / wakeups)
+│   └── edu_latency.c        # Userspace libbpf loader and histogram display
+│
+├── uart-protocol/           # Serial link-layer framing protocol
+│   ├── Makefile             # Cross-platform build script (macOS/Linux)
+│   ├── uart_frame.h         # Basic framing format interface
+│   ├── uart_frame.c         # Framing implementation (byte stuffing, XOR checksums)
+│   ├── uart_test.c          # Frame loopback, stuffing, and recovery verification
+│   └── reliable/            # ACK/NACK reliable transmission layer
+│       ├── Makefile         # Reliable layer build script
+│       ├── uart_reliable.h  # Reliable protocol packet interface
+│       ├── uart_reliable.c  # Sequence numbering, sliding timeouts, duplicate checks
+│       └── uart_reliable_test.c
+│
+├── scripts/                 # Guest VM bootstrap and toolchain installers
+│   ├── boot_qemu.sh         # Boots aarch64 QEMU VM with Apple HVF and Virtual PCIe EDU device
+│   ├── make_seed.sh         # Generates cloud-init seed.iso for password setup
+│   ├── mount_share.sh       # Inside-VM configuration tool (apt dependencies, workspace)
+│   └── cloud-init/          # Cloud-init system metadata and userdata configurations
+│
+├── buildroot-config/        # Alternative system images
+│   └── edu_defconfig        # Buildroot config file (if running outside Ubuntu)
+│
+└── report/                  # Engineering report and developer documentation
+    └── report.md            # Hardware register mapping details and design notes
 ```
 
 ---
