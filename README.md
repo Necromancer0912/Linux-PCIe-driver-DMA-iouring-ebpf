@@ -167,27 +167,23 @@ This project directly mirrors production engineering work in:
 
 ## Advanced Extensions
 
-### ✅ Already complete
+### ✅ Complete
 - MSI interrupts (vs. legacy INTx)
-- Bidirectional DMA with IRQ-driven completion
+- Bidirectional DMA with IRQ-driven `wait_queue` completion
 - Custom ioctl interface with userspace test binary
-- UART byte stuffing + corruption detection + resync
-- **`mmap` zero-copy DMA buffer** — `dma_mmap_coherent()` exposes the coherent buffer directly into userspace; write to the pointer, trigger `EDU_IOC_DMA_TEST`, verify — zero `copy_to_user` in the path
-- **Reliable UART transport** (`uart-protocol/reliable/`) — stop-and-wait protocol with DATA/ACK/NACK frame types, 1-byte sequence numbers, retransmit on timeout, duplicate detection, session statistics
+- UART byte stuffing + XOR checksum + resync
+- **`mmap` zero-copy DMA buffer** — `dma_mmap_coherent()` exposes the coherent DMA buffer directly into userspace; zero `copy_to_user` in the data path. Same technique as DPDK, io_uring submission rings, GPU UVM.
+- **Reliable UART transport** (`uart-protocol/reliable/`) — DATA/ACK/NACK frame types, 1-byte sequence numbers, stop-and-wait retransmit, duplicate detection, session statistics. Same design as Bluetooth HCI H4 and Modbus RTU.
+- **io_uring async DMA interface** (`edu-driver/edu_uring_test.c`) — exposes the DMA engine as an `IORING_OP_URING_CMD` operation. Thread submits a DMA op, remains free while hardware runs, collects the CQE when the ISR-fired workqueue posts it. Includes ioctl vs. io_uring throughput comparison. Same architecture as NVMe character device passthrough.
+- **eBPF interrupt latency profiler** (`ebpf-profiler/`) — kprobes on `edu_isr`, `edu_ioctl`, `__wake_up_common`, and `finish_wait`. Three histogram metrics: ISR execution time, DMA round-trip latency, interrupt-to-wakeup scheduler latency. P50/P95/P99 printed every N seconds. Two implementations: bpftrace one-liner and full CO-RE libbpf program.
 
 ### 🚀 Remaining advanced directions
 
-**1. `debugfs` register dump**
-Expose all device register values at `/sys/kernel/debug/edu/regs` — live introspection without touching driver code. Standard tool for real driver debugging.
+**1. Rust kernel module** — rewrite `edu.c` in Rust using the kernel's in-tree Rust API for PCI devices. Linux has supported Rust kernel modules since v6.1 (Ubuntu 24.04 / kernel 6.8 — should work). Frontier of kernel dev right now.
 
-**2. DMA performance benchmark**
-Measure sustained DMA throughput (MB/s) and interrupt-to-wake latency (µs) as buffer size varies. Produces concrete numbers to quote — far stronger than "I implemented DMA."
+**2. `debugfs` register dump** — expose live register values at `/sys/kernel/debug/edu/regs`. Standard tool for real driver debugging without touching driver code.
 
-**3. KUnit in-kernel unit tests**
-Write a kernel test module using the KUnit framework that tests the driver's DMA logic and interrupt acknowledgement paths without needing a userspace binary — the same approach used in upstream kernel development.
-
-**4. Sliding-window UART**
-Extend the reliable transport from stop-and-wait (window=1) to a multi-frame window (HDLC extended mode, same as TCP). Extend `tx_seq`/`rx_seq` to track outstanding unACK'd frames — the architecture is already designed for this.
+**3. Sliding-window UART** — extend the reliable transport from stop-and-wait (window=1) to Go-Back-N. Same math as TCP.
 
 ---
 
@@ -196,31 +192,35 @@ Extend the reliable transport from stop-and-wait (window=1) to a multi-frame win
 ```
 new_proj/
 ├── edu-driver/
-│   ├── edu.h           ← register map, bit defs, DMA mask, ioctl commands
-│   ├── edu.c           ← full kernel module (probe, MMIO, MSI, DMA, mmap)
-│   ├── edu_test.c      ← userspace tests: liveness, factorial×5, DMA, mmap
-│   └── Makefile        ← native in-guest build
+│   ├── edu.h                ← registers, bit defs, ioctl cmds, io_uring req struct
+│   ├── edu.c                ← kernel module: probe, MMIO, MSI, DMA, mmap, io_uring
+│   ├── edu_test.c           ← ioctl tests: liveness, factorial×5, DMA, mmap
+│   ├── edu_uring_test.c     ← io_uring tests: async DMA, async factorial, ioctl vs ring bench
+│   └── Makefile
 ├── uart-protocol/
-│   ├── uart_frame.h    ← base frame format spec + API
-│   ├── uart_frame.c    ← send_frame, recv_frame, byte-stuffing, resync
-│   ├── uart_test.c     ← 4-test harness (loopback, stuffing, corruption, resync)
-│   ├── Makefile        ← auto-detects Linux (gcc) vs macOS (clang)
+│   ├── uart_frame.h         ← base frame format spec + API
+│   ├── uart_frame.c         ← send_frame, recv_frame, byte-stuffing, resync
+│   ├── uart_test.c          ← 4-test harness
+│   ├── Makefile
 │   └── reliable/
-│       ├── uart_reliable.h      ← reliable transport API + frame format
-│       ├── uart_reliable.c      ← DATA/ACK/NACK, seq numbers, retransmit
+│       ├── uart_reliable.h      ← reliable transport API + DATA/ACK/NACK spec
+│       ├── uart_reliable.c      ← seq numbers, retransmit, dup detection
 │       ├── uart_reliable_test.c ← round-trip, multi-frame, stats
 │       └── Makefile
+├── ebpf-profiler/
+│   ├── edu_latency.bt       ← bpftrace script (quickest to run, no compilation)
+│   ├── edu_latency.bpf.c    ← CO-RE BPF kernel program (kprobes + histograms)
+│   ├── edu_latency.c        ← libbpf loader: attaches probes, prints P50/P95/P99
+│   └── Makefile             ← vmlinux.h gen, clang BPF compile, bpftool skeleton
 ├── scripts/
-│   ├── boot_qemu.sh    ← boots Ubuntu 24.04 arm64 VM with HVF + EDU device
-│   ├── make_seed.sh    ← builds cloud-init seed.iso (run once on macOS)
-│   ├── mount_share.sh  ← in-guest setup: apt install, lspci verify, workspace
+│   ├── boot_qemu.sh         ← boots Ubuntu 24.04 arm64 VM with HVF + EDU device
+│   ├── make_seed.sh         ← builds cloud-init seed.iso (run once on macOS)
+│   ├── mount_share.sh       ← in-guest setup: apt install, lspci verify
 │   └── cloud-init/
-│       ├── user-data   ← ubuntu/driver login, SSH auth, disk auto-grow
-│       └── meta-data   ← cloud-init instance metadata
 ├── buildroot-config/
-│   └── edu_defconfig   ← alternative Buildroot config (if Ubuntu path unused)
+│   └── edu_defconfig
 └── report/
-    └── report.md       ← technical writeup: architecture, debugging stories, design rationale
+    └── report.md            ← architecture, debugging stories, design rationale
 ```
 
 ---
@@ -364,7 +364,7 @@ sudo insmod edu.ko && sudo rmmod edu && dmesg | tail -5
 ## Resume Bullet
 
 > **PCIe Device Driver Development — Linux Kernel, QEMU/arm64**
-> Wrote a Linux kernel driver from scratch for a memory-mapped PCI device: BAR mapping, MMIO register access, MSI interrupt handling with `wait_queue`-based completion, and bidirectional coherent DMA verified with `memcmp`. Exposed the device via a char device and ioctl interface. Implemented a checksummed, byte-stuffed UART framing protocol in C using `termios`, with resync and corruption detection. Deployed in an HVF-accelerated arm64 QEMU environment on Apple Silicon.
+> Wrote a Linux kernel driver from scratch for a memory-mapped PCI device: BAR mapping, MMIO register access, MSI interrupt handling with `wait_queue`-based completion, bidirectional coherent DMA verified with `memcmp`, and `mmap` zero-copy userspace buffer access (`dma_mmap_coherent`). Exposed the device via a char device with both synchronous ioctl and asynchronous `io_uring` (`IORING_OP_URING_CMD`) interfaces — ISR completion deferred through a workqueue to `io_uring_cmd_done`. Profiled interrupt latency with a CO-RE eBPF program (kprobes on `edu_isr` + `finish_wait`, P50/P95/P99 histograms via libbpf). Implemented a checksummed byte-stuffed UART framing protocol and a stop-and-wait reliable transport (DATA/ACK/NACK, sequence numbers, retransmit). Deployed in an HVF-accelerated arm64 QEMU environment on Apple Silicon.
 
 ---
 

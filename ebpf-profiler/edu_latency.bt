@@ -1,0 +1,148 @@
+#!/usr/bin/env bpftrace
+/*
+ * edu_latency.bt — EDU driver interrupt latency profiler (bpftrace version)
+ *
+ * Measures three things every 5 seconds:
+ *   1. ISR execution time      (µs) — how long edu_isr() takes to run
+ *   2. DMA ioctl latency       (µs) — total ioctl(EDU_IOC_DMA_TEST) round-trip
+ *   3. Interrupt-to-wakeup     (µs) — ISR wake_up() → thread resumes
+ *
+ * Requirements (inside the Linux guest):
+ *   apt install bpftrace
+ *   sudo insmod /path/to/edu.ko      ← module must be loaded first
+ *   sudo bpftrace edu_latency.bt
+ *
+ * In another terminal, drive the device while this runs:
+ *   sudo ./edu_test                  ← standard ioctl tests
+ *   sudo ./edu_uring_test            ← io_uring async tests
+ *
+ * Expected output (latency numbers vary):
+ *   === EDU Interrupt Latency Profile ===
+ *
+ *   ISR execution time (µs):
+ *   [0, 1)   ████████████████  42
+ *   [1, 2)   ██████             16
+ *   [2, 4)   ███                 8
+ *
+ *   DMA ioctl round-trip latency (µs):
+ *   [64, 128)  ██████████████  35
+ *   [128, 256) ████████         20
+ *
+ *   Interrupt → wakeup latency (µs):
+ *   [4, 8)   ████████████████  40
+ *   [8, 16)  ████████           22
+ *
+ * Interpretation:
+ *   ISR time    < 5 µs  → good (interrupt handler is lean)
+ *   ISR time    > 20 µs → bad  (too much work in IRQ context)
+ *   DMA latency ~100 µs → expected for QEMU virtual device
+ *   Wakeup lat  < 10 µs → good scheduler responsiveness
+ */
+
+BEGIN
+{
+    printf("EDU driver latency profiler — hit Ctrl-C or wait for 5s intervals\n");
+    printf("Make sure to run ./edu_test or ./edu_uring_test in another terminal.\n\n");
+}
+
+/* ── Metric 1: ISR execution time ───────────────────────────────────────── */
+/* kprobe attaches to the entry of edu_isr in the loaded module */
+kprobe:edu_isr
+{
+    @isr_entry_ns[cpu] = nsecs;
+}
+
+kretprobe:edu_isr
+/@isr_entry_ns[cpu]/
+{
+    $duration_ns = nsecs - @isr_entry_ns[cpu];
+    /* Store latency in microseconds histogram */
+    @isr_exec_us = hist($duration_ns / 1000);
+    delete(@isr_entry_ns[cpu]);
+    @isr_count++;
+}
+
+/* ── Metric 2: DMA ioctl round-trip latency ─────────────────────────────── *
+ * EDU_IOC_DMA_TEST = _IO('E', 2) = 0x4502
+ * kprobe on edu_ioctl captures when the ioctl syscall enters our handler.
+ */
+kprobe:edu_ioctl
+/arg2 == 0x4502/    /* only time the DMA_TEST ioctl */
+{
+    @ioctl_entry_ns[tid] = nsecs;
+}
+
+kretprobe:edu_ioctl
+/@ioctl_entry_ns[tid]/
+{
+    $latency_ns = nsecs - @ioctl_entry_ns[tid];
+    @dma_ioctl_us = hist($latency_ns / 1000);
+    delete(@ioctl_entry_ns[tid]);
+}
+
+/* ── Metric 3: Interrupt → thread wakeup latency ───────────────────────── *
+ * We measure from when the ISR calls wake_up() (i.e., it's done handling
+ * the interrupt) to when the sleeping edu_ioctl thread resumes execution.
+ * This captures scheduler latency + context-switch overhead.
+ *
+ * We instrument __wake_up_common which is the internal implementation of
+ * wake_up() — it fires for every wake_up*() family call.
+ * We then catch finish_wait() which the woken thread calls when it resumes.
+ */
+kprobe:__wake_up_common
+{
+    /* Only care about the specific waitqueue inside our ioctl */
+    @wakeup_ts[tid] = nsecs;
+}
+
+kprobe:finish_wait
+/@wakeup_ts[tid]/
+{
+    $delta_ns = nsecs - @wakeup_ts[tid];
+    if ($delta_ns < 1000000) {     /* only record if < 1ms (filter noise) */
+        @wakeup_latency_us = hist($delta_ns / 1000);
+    }
+    delete(@wakeup_ts[tid]);
+}
+
+/* ── Print stats every 5 seconds ───────────────────────────────────────── */
+interval:s:5
+{
+    printf("\n════════════════════════════════════════════════════════\n");
+    printf("  EDU Interrupt Latency Profile  (5-second snapshot)\n");
+    printf("════════════════════════════════════════════════════════\n");
+
+    printf("\n[1] ISR execution time (µs)  — %lu interrupts this interval:\n",
+           @isr_count);
+    print(@isr_exec_us);
+
+    printf("\n[2] DMA ioctl round-trip latency (µs):\n");
+    print(@dma_ioctl_us);
+
+    printf("\n[3] Interrupt → thread wakeup latency (µs):\n");
+    print(@wakeup_latency_us);
+
+    /* Clear for next interval */
+    clear(@isr_exec_us);
+    clear(@dma_ioctl_us);
+    clear(@wakeup_latency_us);
+    @isr_count = 0;
+
+    printf("\n(Next snapshot in 5 seconds. Ctrl-C to exit.)\n");
+}
+
+END
+{
+    printf("\n════════ Final summary ════════\n");
+    printf("ISR execution time (µs):\n");
+    print(@isr_exec_us);
+    printf("\nDMA ioctl round-trip (µs):\n");
+    print(@dma_ioctl_us);
+    printf("\nInterrupt → wakeup (µs):\n");
+    print(@wakeup_latency_us);
+
+    /* Clean up maps */
+    clear(@isr_entry_ns);
+    clear(@ioctl_entry_ns);
+    clear(@wakeup_ts);
+}

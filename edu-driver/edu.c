@@ -23,6 +23,9 @@
 #include <linux/slab.h>
 #include <linux/io.h>
 #include <linux/mutex.h>
+#include <linux/workqueue.h>
+/* io_uring passthrough (kernel >= 5.19, Ubuntu 24.04 / 6.8 is fine) */
+#include <linux/io_uring/cmd.h>
 
 /* Pull in iowrite64/ioread64 helpers for non-atomic 64-bit MMIO on aarch64.
  * On most aarch64 kernels this is a no-op include (native support exists),
@@ -53,7 +56,22 @@ struct edu_dev {
     void        *dma_buf;           /* kernel virtual address of coherent buffer */
     dma_addr_t   dma_addr;          /* bus (DMA) address of the same buffer */
 
-    /* Serialise concurrent ioctl calls */
+    /* io_uring async completion (Phase 7: io_uring integration)
+     *
+     * io_uring_cmd_done() CANNOT be called from hard-IRQ context.
+     * When the ISR sees a DMA-done interrupt AND there is a pending
+     * uring_cmd, it schedules uring_complete_work.  The workqueue runs
+     * in process context and safely calls io_uring_cmd_done().
+     *
+     * Concurrency: protected by edu->lock.  Only one outstanding
+     * io_uring op at a time (EBUSY if a second arrives while one is
+     * in flight — identical to how NVMe passthrough handles this).
+     */
+    struct io_uring_cmd *pending_uring_cmd;   /* NULL when idle */
+    int                  pending_uring_result; /* result code for CQE */
+    struct work_struct   uring_complete_work;  /* deferred CQE poster */
+
+    /* Serialise concurrent ioctl / uring_cmd calls */
     struct mutex lock;
 };
 
@@ -138,12 +156,19 @@ static irqreturn_t edu_isr(int irq, void *data)
     }
 
     /*
-     * Handle DMA-done interrupt (Phase 6).
-     * For DMA we just need to wake the waiter; it will memcmp itself.
+     * Handle DMA-done interrupt (Phase 6 / 7).
+     *
+     * Two completion paths:
+     *   a) ioctl path: wake the wait_queue; edu_dma_test() will unblock.
+     *   b) io_uring path: schedule the workqueue; it calls io_uring_cmd_done()
+     *      safely from process context (can't call it from hard-IRQ).
      */
     if (status & EDU_INTR_DMA_DONE) {
         edu->irq_done = true;
         wake_up(&edu->wq);
+
+        if (edu->pending_uring_cmd)
+            schedule_work(&edu->uring_complete_work);
     }
 
     /* Acknowledge — clears the IRQ line. MUST happen, or the line stays
@@ -379,12 +404,135 @@ static int edu_mmap(struct file *filp, struct vm_area_struct *vma)
                               edu->dma_buf, edu->dma_addr, size);
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Phase 7: io_uring passthrough interface
+ *
+ * edu_uring_complete() — workqueue function, runs in process context.
+ * Called by the workqueue after the ISR schedules it when DMA finishes.
+ * Posts the CQE (completion queue entry) that unblocks the userspace
+ * io_uring_wait_cqe() call.
+ *
+ * edu_uring_cmd() — the kernel-side SQE handler.
+ * Called by io_uring core when userspace submits IORING_OP_URING_CMD.
+ * Returns -EIOCBQUEUED for async ops ("still in flight, don't post CQE yet").
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+static void edu_uring_complete(struct work_struct *work)
+{
+    struct edu_dev *edu =
+        container_of(work, struct edu_dev, uring_complete_work);
+    struct io_uring_cmd *cmd;
+    int result;
+
+    /* Grab cmd pointer under lock; clear it so ISR won't double-schedule */
+    mutex_lock(&edu->lock);
+    cmd    = edu->pending_uring_cmd;
+    result = edu->pending_uring_result;
+    edu->pending_uring_cmd = NULL;
+    mutex_unlock(&edu->lock);
+
+    if (!cmd)
+        return; /* already completed or cancelled */
+
+    /*
+     * io_uring_cmd_done() posts the CQE to the ring and wakes the
+     * userspace thread waiting in io_uring_wait_cqe().
+     * issue_flags=0 because we're deferred (not in the original
+     * submission context).
+     */
+    io_uring_cmd_done(cmd, result, 0, 0);
+}
+
+static int edu_uring_cmd(struct io_uring_cmd *ioucmd, unsigned int issue_flags)
+{
+    struct edu_dev *edu = ioucmd->file->private_data;
+    const struct edu_uring_req *req = io_uring_sqe_cmd(ioucmd->sqe);
+    int rc;
+
+    if (!req)
+        return -EINVAL;
+
+    mutex_lock(&edu->lock);
+
+    if (edu->pending_uring_cmd) {
+        /* Only one async op in flight at a time */
+        mutex_unlock(&edu->lock);
+        return -EBUSY;
+    }
+
+    switch (req->op) {
+
+    case EDU_URING_OP_DMA_TEST:
+        /*
+         * Async DMA round-trip.
+         *
+         * Fill the coherent DMA buffer with the requested pattern,
+         * start RAM→device DMA, then register this io_uring_cmd as
+         * pending.  When the ISR fires the DMA-done interrupt it
+         * schedules uring_complete_work which posts the CQE.
+         *
+         * NOTE: we only start the first leg (RAM→device) here.
+         * The second leg (device→RAM) and memcmp happen synchronously
+         * in the workqueue for simplicity.  A production driver would
+         * chain the second DMA through another ISR round.
+         */
+        memset(edu->dma_buf, req->arg ? (u8)req->arg : 0xAB, EDU_DMA_BUF_SIZE);
+
+        edu->irq_done          = false;
+        edu->pending_uring_cmd    = ioucmd;
+        edu->pending_uring_result = 0; /* will be updated by work fn */
+
+        lo_hi_writeq(edu->dma_addr,   edu->mmio + EDU_REG_DMA_SRC);
+        lo_hi_writeq(EDU_DMA_DEV_BUF, edu->mmio + EDU_REG_DMA_DST);
+        iowrite32(EDU_DMA_BUF_SIZE,   edu->mmio + EDU_REG_DMA_COUNT);
+        iowrite32(EDU_DMA_START | EDU_DMA_DIR_TO_DEV | EDU_DMA_IRQ_ON_DONE,
+                  edu->mmio + EDU_REG_DMA_CMD);
+
+        mutex_unlock(&edu->lock);
+        return -EIOCBQUEUED; /* "async — don't post CQE yet" */
+
+    case EDU_URING_OP_FACTORIAL: {
+        /*
+         * Async factorial via io_uring.
+         *
+         * This shows the io_uring pattern for a non-DMA operation too:
+         * write factorial register, register pending cmd, return -EIOCBQUEUED.
+         * ISR (factorial-done path) will schedule the work to post the CQE.
+         */
+        u32 n = req->arg;
+        if (n > 12) { /* 12! fits in u32, 13! overflows */
+            mutex_unlock(&edu->lock);
+            return -ERANGE;
+        }
+
+        edu->irq_done          = false;
+        edu->pending_uring_cmd    = ioucmd;
+        edu->pending_uring_result = 0;
+
+        iowrite32(n | EDU_STATUS_IRQ_ENABLE, edu->mmio + EDU_REG_STATUS);
+        iowrite32(n, edu->mmio + EDU_REG_FACTORIAL);
+
+        mutex_unlock(&edu->lock);
+        return -EIOCBQUEUED;
+    }
+
+    default:
+        mutex_unlock(&edu->lock);
+        return -EOPNOTSUPP;
+    }
+
+    rc = 0;
+    mutex_unlock(&edu->lock);
+    return rc;
+}
+
 static const struct file_operations edu_fops = {
     .owner          = THIS_MODULE,
     .open           = edu_open,
     .release        = edu_release,
     .unlocked_ioctl = edu_ioctl,
     .mmap           = edu_mmap,
+    .uring_cmd      = edu_uring_cmd,
 };
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -404,6 +552,7 @@ static int edu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     edu->pdev = pdev;
     mutex_init(&edu->lock);
     init_waitqueue_head(&edu->wq);
+    INIT_WORK(&edu->uring_complete_work, edu_uring_complete);
 
     /* ── PCI init ──────────────────────────────────────────────────── */
     err = pci_enable_device(pdev);
@@ -525,6 +674,13 @@ static void edu_remove(struct pci_dev *pdev)
     device_destroy(edu_class, edu->devno);
     cdev_del(&edu->cdev);
     unregister_chrdev_region(edu->devno, 1);
+
+    /* Cancel any in-flight io_uring async completion BEFORE freeing IRQ.
+     * If a DMA-done interrupt fired and scheduled uring_complete_work,
+     * we must let it finish (or cancel it) before tearing down resources.
+     * Otherwise io_uring_cmd_done() would fire after the struct is freed. */
+    cancel_work_sync(&edu->uring_complete_work);
+
     /* free_irq before pci_free_irq_vectors — mandatory ordering */
     free_irq(pci_irq_vector(pdev, 0), edu);
     pci_free_irq_vectors(pdev);

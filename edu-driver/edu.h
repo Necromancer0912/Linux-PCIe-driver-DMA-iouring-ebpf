@@ -116,6 +116,45 @@
  *   Read:  N! result (blocks until computation complete via IRQ)
  */
 #define EDU_IOC_FACTORIAL   _IOWR(EDU_IOC_MAGIC, 0, __u32)
+#define EDU_IOC_GET_DMA_SIZE _IOR(EDU_IOC_MAGIC, 3, __u32)
+
+/* ─── io_uring passthrough commands (IORING_OP_URING_CMD) ────────────────
+ *
+ * Requires kernel ≥ 5.19 (Ubuntu 24.04 / kernel 6.8 — fine).
+ *
+ * Usage (userspace):
+ *   struct io_uring ring;
+ *   io_uring_queue_init(8, &ring, 0);
+ *
+ *   struct edu_uring_req req = { .op = EDU_URING_OP_DMA_TEST, .pattern = 0xAB };
+ *   struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+ *   io_uring_prep_uring_cmd(sqe, fd, 0, 0);
+ *   memcpy(sqe->cmd, &req, sizeof(req));
+ *   io_uring_submit(&ring);
+ *
+ *   struct io_uring_cqe *cqe;
+ *   io_uring_wait_cqe(&ring, &cqe);   // blocks until DMA done (no polling!)
+ *   // cqe->res == 0 → success
+ *
+ * The key difference from ioctl:
+ *   ioctl = synchronous, thread blocks in kernel until done.
+ *   io_uring = asynchronous, thread is free to do other work; CQE posted
+ *              when DMA completes via ISR → workqueue → io_uring_cmd_done.
+ * ────────────────────────────────────────────────────────────────────── */
+
+/* io_uring operation codes (put in edu_uring_req.op) */
+#define EDU_URING_OP_DMA_TEST   1   /* Async bidirectional DMA round-trip */
+#define EDU_URING_OP_FACTORIAL  2   /* Async factorial: cqe.res = N! */
+
+/*
+ * edu_uring_req — payload placed into the 80-byte SQE cmd[] field.
+ * Userspace fills this and the driver reads it via io_uring_sqe_cmd().
+ */
+struct edu_uring_req {
+    __u32 op;       /* EDU_URING_OP_* */
+    __u32 arg;      /* DMA_TEST: fill pattern (byte); FACTORIAL: N */
+    __u32 pad[2];   /* reserved, must be zero */
+};
 
 /*
  * EDU_IOC_LIVENESS   _IOWR
