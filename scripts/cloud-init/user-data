@@ -1,0 +1,19 @@
+#cloud-config
+# Cloud-init configuration for the PCIe driver development VM.
+# This file is baked into seed.iso by scripts/make_seed.sh.
+
+# Login: user 'ubuntu', password 'driver'
+# SSH password auth is enabled so you can ssh in immediately without key setup.
+password: driver
+chpasswd:
+  expire: false
+ssh_pwauth: true
+
+hostname: pcievm
+
+# Grow the root partition to fill the +10G we added with qemu-img resize.
+# Without this, the guest only sees the original ~2 GB cloud image size.
+growpart:
+  mode: auto
+  devices: [/]
+resize_rootfs: true

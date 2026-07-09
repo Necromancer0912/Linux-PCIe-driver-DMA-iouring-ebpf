@@ -1,0 +1,43 @@
+# .gitignore — PCIe Kernel Driver + UART Protocol project
+
+# ── Kernel module build artifacts ──────────────────────────────────────────
+*.ko
+*.o
+*.mod
+*.mod.c
+*.mod.o
+*.order
+*.symvers
+.tmp_versions/
+*.d
+modules.order
+Module.symvers
+
+# ── Compiled userspace binaries ─────────────────────────────────────────────
+edu-driver/edu_test
+uart-protocol/uart_test
+uart-protocol/reliable/uart_reliable_test
+
+# ── QEMU disk images and seed ISOs (large binary files, never commit these) ─
+*.img
+*.iso
+*.qcow2
+
+# ── Cloud-init generated output ──────────────────────────────────────────────
+seed.iso
+
+# ── macOS system junk ────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+__MACOSX/
+
+# ── Editor files ─────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── Personal study notes — NOT for the public repo ───────────────────────────
+PERSONAL_NOTES.md

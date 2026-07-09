@@ -1,0 +1,52 @@
+# Buildroot defconfig for QEMU aarch64 virt + EDU driver development
+#
+# HOW TO USE:
+#   cd buildroot
+#   make BR2_DEFCONFIG=../buildroot-config/edu_defconfig defconfig
+#   # (or manually apply the menuconfig changes listed below)
+#   make -j$(sysctl -n hw.ncpu)
+#
+# Expected build time: 60-120 minutes on M4 Air (mostly downloading + compiling GCC).
+# After first build, incremental rebuilds are fast.
+#
+# MANDATORY menuconfig changes (on top of qemu_aarch64_virt_defconfig):
+#
+# 1. Toolchain
+#    → Kernel Headers: same version as the selected kernel (default is fine)
+#    → [optional] Build cross gdb for host: Y (enables in-guest gdb later)
+#
+# 2. Target packages → Hardware handling
+#    → pciutils: Y   (gives you `lspci` inside the guest)
+#
+# 3. System configuration → /dev management
+#    → Dynamic using devtmpfs + eudev: Y
+#       (ensures /dev/edu0 appears automatically when the module loads)
+#
+# 4. Kernel → Linux Kernel
+#    → Defconfig name: virt    (this is already set by qemu_aarch64_virt_defconfig)
+#    → Kernel version: choose a recent stable (6.1 LTS recommended)
+#
+# OUTPUT ARTIFACTS (used by boot_qemu.sh):
+#   output/images/Image         — uncompressed aarch64 kernel image
+#   output/images/rootfs.ext4   — root filesystem
+#
+# CROSS-COMPILER (for building kernel module from macOS):
+#   output/host/bin/aarch64-buildroot-linux-gnu-gcc
+#   KDIR = output/build/linux-*/
+#
+# SNAPSHOT: after configuring, run:
+#   make savedefconfig DEFCONFIG=../buildroot-config/edu_defconfig
+# to update this file with your exact configuration.
+
+# This file will be overwritten by `make savedefconfig` with the actual
+# Buildroot configuration syntax. The comments above are for human reference.
+#
+# Minimal saved config (placeholder until first `make savedefconfig`):
+BR2_aarch64=y
+BR2_TOOLCHAIN_BUILDROOT_GLIBC=y
+BR2_LINUX_KERNEL=y
+BR2_LINUX_KERNEL_DEFCONFIG="virt"
+BR2_TARGET_ROOTFS_EXT2=y
+BR2_TARGET_ROOTFS_EXT2_4=y
+BR2_PACKAGE_PCIUTILS=y
+BR2_ROOTFS_DEVICE_CREATION_DYNAMIC_EUDEV=y
